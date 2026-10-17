@@ -38,7 +38,7 @@ This image viewer inclued:
 -Deep Learning Capabilities- two model architectures to train- Shallow MLP and 2D Unet
 -Deep Learning Training Capabilities- loss function selection, learning rate selection, steps, patch sizes, and more
 -Live training monitoring 
--Save and load models 
+-Save and load models- models trained for hw2 are in saved models folder
 
 
 ## Extra Credit
