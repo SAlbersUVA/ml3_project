@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import "./App.css";
+import DataViewer from "./DataViewer";
 
 function hexToRgba(hex) {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -89,6 +90,22 @@ function App() {
   const layersLoadedRef = useRef(false);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
+  const [maskStatus, setMaskStatus] = useState("");
+  const [sldyMasks, setSldyMasks] = useState(null); // mask names found inside the .sldy
+  const [sldyMaskPick, setSldyMaskPick] = useState(0);
+  const [showDataViewer, setShowDataViewer] = useState(false);
+  const maskInputRef = useRef(null);
+  const pendingLayerLoadRef = useRef(null); // id of a just-imported layer waiting for its canvas
+
+  // Orthogonal view state
+  const [viewAxis, setViewAxis] = useState("xy"); // "xy" | "xz" | "yz"
+  const [volumeDims, setVolumeDims] = useState({
+    numPlanes: 1,
+    height: 0,
+    width: 0,
+  });
+  const [xzIndex, setXzIndex] = useState(0);
+  const [yzIndex, setYzIndex] = useState(0);
 
   const [layers, setLayers] = useState([
     { id: "layer-1", name: "Layer 1", color: DEFAULT_COLORS[0], visible: true },
@@ -97,6 +114,24 @@ function App() {
   const [baseVisible, setBaseVisible] = useState(true);
 
   const activeLayer = layers.find((l) => l.id === activeLayerId) || layers[0];
+
+  function getAxisIndex() {
+    if (viewAxis === "xy") return plane;
+    if (viewAxis === "xz") return xzIndex;
+    return yzIndex;
+  }
+
+  function setAxisIndex(v) {
+    if (viewAxis === "xy") setPlane(v);
+    else if (viewAxis === "xz") setXzIndex(v);
+    else setYzIndex(v);
+  }
+
+  function getAxisMax() {
+    if (viewAxis === "xy") return numPlanes - 1;
+    if (viewAxis === "xz") return volumeDims.height - 1;
+    return volumeDims.width - 1;
+  }
 
   function addLayer() {
     const n = nextLayerNum.current++;
@@ -180,6 +215,11 @@ function App() {
       .then((data) => {
         if (ignore) return;
         setNumPlanes(data.numPlanes);
+        setVolumeDims({
+          numPlanes: data.numPlanes,
+          height: data.height,
+          width: data.width,
+        });
       })
       .catch((err) => console.error("Failed to fetch file info:", err));
     return () => {
@@ -263,9 +303,10 @@ function App() {
     };
   }, [draggingHandle, histogram, blackPoint, whitePoint]);
 
-  // Load base image + all layer canvases whenever file/plane/contrast changes
+  // Load base image + all layer canvases whenever file/plane/contrast changes (XY view only)
   useEffect(() => {
     if (!selectedFile) return;
+    if (viewAxis !== "xy") return;
     let cancelled = false;
 
     const isNewPlane =
@@ -342,7 +383,190 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedFile, plane, blackPoint, whitePoint]);
+  }, [selectedFile, plane, blackPoint, whitePoint, viewAxis]);
+
+  // Load a display-only slice whenever viewing XZ or YZ
+  useEffect(() => {
+    if (!selectedFile) return;
+    if (viewAxis === "xy") return;
+    let cancelled = false;
+
+    const axisIndex = viewAxis === "xz" ? xzIndex : yzIndex;
+    const url = `http://localhost:5000/api/slice/${selectedFile}/${viewAxis}/${axisIndex}?min=${blackPoint}&max=${whitePoint}`;
+
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      setImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+
+      const baseCanvas = baseCanvasRef.current;
+      if (baseCanvas) {
+        baseCanvas.width = img.naturalWidth;
+        baseCanvas.height = img.naturalHeight;
+        const ctx = baseCanvas.getContext("2d");
+        ctx.clearRect(0, 0, baseCanvas.width, baseCanvas.height);
+        ctx.drawImage(img, 0, 0);
+      }
+    };
+    img.onerror = () => {
+      console.error("Failed to load slice:", url);
+    };
+    img.src = url;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFile, viewAxis, xzIndex, yzIndex, blackPoint, whitePoint]);
+
+  // After a mask is imported, its new layer needs a canvas. Once the canvas exists,
+  // draw the current plane's saved mask onto it.
+  useEffect(() => {
+    const id = pendingLayerLoadRef.current;
+    if (!id || !canvasRefs.current[id] || !selectedFile) return;
+    pendingLayerLoadRef.current = null;
+
+    fetch(`http://localhost:5000/api/annotations/${selectedFile}/${plane}`)
+      .then((res) => res.json())
+      .then((data) => {
+        const canvas = canvasRefs.current[id];
+        const base = baseCanvasRef.current;
+        if (!canvas || !base) return;
+        canvas.width = base.width;
+        canvas.height = base.height;
+        const url = (data.layers || {})[id];
+        if (!url) return;
+        const img = new Image();
+        img.onload = () => canvas.getContext("2d").drawImage(img, 0, 0);
+        img.src = url;
+      })
+      .catch((err) => console.error("Failed to show imported mask:", err));
+  }, [layers]);
+
+  // Save what's on screen first, so an import can't be overwritten by it
+  async function saveCurrentPlaneBeforeImport() {
+    const layerData = {};
+    Object.entries(canvasRefs.current).forEach(([id, canvas]) => {
+      if (canvas) layerData[id] = canvas.toDataURL();
+    });
+    await fetch(
+      `http://localhost:5000/api/annotations/${selectedFile}/${plane}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ layers: layerData }),
+      },
+    ).catch((err) => console.error("Failed to save before import:", err));
+  }
+
+  function makeImportLayer(name) {
+    const n = nextLayerNum.current++;
+    return {
+      id: `layer-${Date.now()}`,
+      name,
+      color: DEFAULT_COLORS[(n - 1) % DEFAULT_COLORS.length],
+      visible: true,
+    };
+  }
+
+  function finishImport(newLayer, paintedPlanes) {
+    pendingLayerLoadRef.current = newLayer.id;
+    setLayers((prev) => [...prev, newLayer]);
+    setActiveLayerId(newLayer.id);
+    setMaskStatus(
+      `Loaded "${newLayer.name}" (${paintedPlanes} planes with painting)`,
+    );
+  }
+
+  async function handleMaskFileChosen(e) {
+    const file = e.target.files[0];
+    e.target.value = ""; // lets you pick the same file again later
+    if (!file || !selectedFile) return;
+
+    setMaskStatus("Loading mask...");
+    await saveCurrentPlaneBeforeImport();
+
+    const newLayer = makeImportLayer(file.name.replace(/\.[^/.]+$/, ""));
+    const form = new FormData();
+    form.append("file", file);
+    form.append("layerId", newLayer.id);
+    form.append("color", newLayer.color);
+
+    try {
+      const res = await fetch(
+        `http://localhost:5000/api/mask/import/${selectedFile}`,
+        { method: "POST", body: form },
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        setMaskStatus(data.error || "Could not load that mask");
+        return;
+      }
+      finishImport(newLayer, data.paintedPlanes);
+    } catch (err) {
+      console.error("Failed to import mask:", err);
+      setMaskStatus("Could not reach the backend");
+    }
+  }
+
+  // Step 1 for .sldy files: ask the backend which masks the file contains
+  async function handleFindSldyMasks() {
+    if (!selectedFile) return;
+    setMaskStatus("Looking for masks in this file...");
+    try {
+      const res = await fetch(
+        `http://localhost:5000/api/mask/sldy/${selectedFile}`,
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        setMaskStatus(data.error || "Could not read masks");
+        return;
+      }
+      if (data.masks.length === 0) {
+        setSldyMasks(null);
+        setMaskStatus("This .sldy file has no masks.");
+        return;
+      }
+      setSldyMasks(data.masks);
+      setSldyMaskPick(0);
+      setMaskStatus("");
+    } catch (err) {
+      console.error("Failed to list sldy masks:", err);
+      setMaskStatus("Could not reach the backend");
+    }
+  }
+
+  // Step 2: copy the chosen mask into a new layer
+  async function handleImportSldyMask() {
+    if (!selectedFile || !sldyMasks) return;
+    setMaskStatus("Importing mask...");
+    await saveCurrentPlaneBeforeImport();
+
+    const newLayer = makeImportLayer(sldyMasks[sldyMaskPick] || "Mask");
+    try {
+      const res = await fetch(
+        `http://localhost:5000/api/mask/import-sldy/${selectedFile}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            layerId: newLayer.id,
+            maskIndex: sldyMaskPick,
+            color: newLayer.color,
+          }),
+        },
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        setMaskStatus(data.error || "Could not import that mask");
+        return;
+      }
+      finishImport(newLayer, data.paintedPlanes);
+      setSldyMasks(null);
+    } catch (err) {
+      console.error("Failed to import sldy mask:", err);
+      setMaskStatus("Could not reach the backend");
+    }
+  }
 
   function handleSetDirectory(e) {
     e.preventDefault();
@@ -370,9 +594,14 @@ function App() {
 
   function handleSelectFile(file) {
     setSelectedFile(file);
+    setSldyMasks(null);
+    setMaskStatus("");
     setZoom(1);
     setPan({ x: 0, y: 0 });
     setPlane(0);
+    setViewAxis("xy");
+    setXzIndex(0);
+    setYzIndex(0);
   }
 
   function handleWheel(e) {
@@ -404,14 +633,6 @@ function App() {
 
   function zoomOut() {
     setZoom((z) => Math.max(z - 0.2, 0.2));
-  }
-
-  function previousPlane() {
-    setPlane((p) => Math.max(p - 1, 0));
-  }
-
-  function nextPlane() {
-    setPlane((p) => Math.min(p + 1, numPlanes - 1));
   }
 
   function getCanvasPoint(e, canvas) {
@@ -595,6 +816,56 @@ function App() {
     refreshUndoRedoState();
   }
 
+  async function handleExportAnnotations() {
+    if (!selectedFile) return;
+
+    // Make sure the plane we're currently viewing is saved before exporting
+    const layerData = {};
+    Object.entries(canvasRefs.current).forEach(([id, canvas]) => {
+      if (canvas) layerData[id] = canvas.toDataURL();
+    });
+    await fetch(
+      `http://localhost:5000/api/annotations/${selectedFile}/${plane}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ layers: layerData }),
+      },
+    ).catch((err) =>
+      console.error("Failed to save current plane before export:", err),
+    );
+
+    const layerIds = layers.map((l) => l.id);
+    const layerNames = {};
+    layers.forEach((l) => {
+      layerNames[l.id] = l.name;
+    });
+
+    try {
+      const res = await fetch(
+        `http://localhost:5000/api/export/${selectedFile}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ layerIds, layerNames }),
+        },
+      );
+      if (!res.ok) throw new Error("Export failed");
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${selectedFile.replace(/\.[^/.]+$/, "")}_annotations.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to export annotations:", err);
+    }
+  }
+
   return (
     <div className="app">
       <div className="sidebar">
@@ -691,7 +962,7 @@ function App() {
           </div>
         )}
 
-        {selectedFile && (
+        {selectedFile && viewAxis === "xy" && (
           <div className="layers-panel">
             <p className="layers-title">Layers</p>
 
@@ -751,8 +1022,71 @@ function App() {
             <button className="add-layer-button" onClick={addLayer}>
               + Add layer
             </button>
+            <button
+              className="add-layer-button"
+              onClick={() =>
+                maskInputRef.current && maskInputRef.current.click()
+              }
+            >
+              Load mask (TIFF)
+            </button>
+            <input
+              type="file"
+              accept=".tif,.tiff"
+              ref={maskInputRef}
+              style={{ display: "none" }}
+              onChange={handleMaskFileChosen}
+            />
+            {selectedFile && selectedFile.toLowerCase().endsWith(".sldy") && (
+              <>
+                <button
+                  className="add-layer-button"
+                  onClick={handleFindSldyMasks}
+                >
+                  Import mask from .sldy
+                </button>
+                {sldyMasks && (
+                  <div style={{ marginTop: 6 }}>
+                    <select
+                      value={sldyMaskPick}
+                      onChange={(e) => setSldyMaskPick(Number(e.target.value))}
+                      style={{ width: "100%" }}
+                    >
+                      {sldyMasks.map((name, i) => (
+                        <option key={i} value={i}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="add-layer-button"
+                      onClick={handleImportSldyMask}
+                    >
+                      Import selected mask
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+            {maskStatus && (
+              <p style={{ fontSize: "0.8rem", margin: "6px 0 0" }}>
+                {maskStatus}
+              </p>
+            )}
           </div>
         )}
+        <div style={{ marginTop: 12 }}>
+          <button
+            className="add-layer-button"
+            style={{ width: "100%" }}
+            onClick={() => {
+              console.log("clicked");
+              setShowDataViewer(true);
+            }}
+          >
+            View training data
+          </button>
+        </div>
       </div>
 
       <div className="viewer">
@@ -761,30 +1095,63 @@ function App() {
           <span className="zoom-level">{Math.round(zoom * 100)}%</span>
           <button onClick={zoomIn}>+</button>
 
-          {selectedFile && numPlanes > 1 && (
+          {selectedFile && (
             <>
               <div className="divider" />
-              <button onClick={previousPlane} disabled={plane === 0}>
+              <button
+                className={`tool-button ${viewAxis === "xy" ? "active" : ""}`}
+                onClick={() => setViewAxis("xy")}
+              >
+                XY
+              </button>
+              <button
+                className={`tool-button ${viewAxis === "xz" ? "active" : ""}`}
+                onClick={() => setViewAxis("xz")}
+              >
+                XZ
+              </button>
+              <button
+                className={`tool-button ${viewAxis === "yz" ? "active" : ""}`}
+                onClick={() => setViewAxis("yz")}
+              >
+                YZ
+              </button>
+            </>
+          )}
+
+          {selectedFile && getAxisMax() > 0 && (
+            <>
+              <div className="divider" />
+              <button
+                onClick={() => setAxisIndex(Math.max(getAxisIndex() - 1, 0))}
+                disabled={getAxisIndex() === 0}
+              >
                 ←
               </button>
               <span className="plane-label">
-                Plane {plane + 1} / {numPlanes}
+                {viewAxis.toUpperCase()} {getAxisIndex() + 1} /{" "}
+                {getAxisMax() + 1}
               </span>
               <input
                 type="range"
                 min="0"
-                max={numPlanes - 1}
-                value={plane}
-                onChange={(e) => setPlane(Number(e.target.value))}
+                max={getAxisMax()}
+                value={getAxisIndex()}
+                onChange={(e) => setAxisIndex(Number(e.target.value))}
               />
-              <button onClick={nextPlane} disabled={plane === numPlanes - 1}>
+              <button
+                onClick={() =>
+                  setAxisIndex(Math.min(getAxisIndex() + 1, getAxisMax()))
+                }
+                disabled={getAxisIndex() === getAxisMax()}
+              >
                 →
               </button>
             </>
           )}
         </div>
 
-        {selectedFile && (
+        {selectedFile && viewAxis === "xy" && (
           <div className="annotation-toolbar">
             <button
               className={`tool-button ${annotationTool === "brush" && drawingEnabled ? "active" : ""}`}
@@ -838,6 +1205,20 @@ function App() {
             <button className="tool-button" onClick={handleClearActiveLayer}>
               Clear layer
             </button>
+
+            <div className="divider" />
+            <button className="tool-button" onClick={handleExportAnnotations}>
+              Export TIFF
+            </button>
+          </div>
+        )}
+
+        {selectedFile && viewAxis !== "xy" && (
+          <div className="annotation-toolbar">
+            <span className="active-layer-label">
+              {viewAxis.toUpperCase()} view — inspection only. Switch to XY to
+              annotate.
+            </span>
           </div>
         )}
 
@@ -875,9 +1256,12 @@ function App() {
                   }}
                   className="annotate-canvas"
                   style={{
-                    display: layer.visible ? "block" : "none",
+                    display:
+                      viewAxis === "xy" && layer.visible ? "block" : "none",
                     pointerEvents:
-                      layer.id === activeLayerId && drawingEnabled
+                      viewAxis === "xy" &&
+                      layer.id === activeLayerId &&
+                      drawingEnabled
                         ? "auto"
                         : "none",
                   }}
@@ -895,6 +1279,27 @@ function App() {
           )}
         </div>
       </div>
+      {showDataViewer && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            background: "red",
+            color: "white",
+            padding: 20,
+            zIndex: 99999,
+          }}
+        >
+          STATE IS TRUE
+        </div>
+      )}
+      {showDataViewer && (
+        <DataViewer
+          filename={selectedFile}
+          onClose={() => setShowDataViewer(false)}
+        />
+      )}
     </div>
   );
 }

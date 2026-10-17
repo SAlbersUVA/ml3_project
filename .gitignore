@@ -23,4 +23,12 @@ dist-ssr
 *.sln
 *.sw?
 
-backend/app.db backend/__pycache__/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local data and settings
+backend/app.db
+backend/settings.json

@@ -9,11 +9,29 @@ import io
 import os
 import sqlite3
 import datetime
+import base64
+import zipfile
 
 app = Flask(__name__)
 CORS(app)
 
-DATA_DIR = "C:/Users/xhd6ct/Documents/research_data"  # starting default — can be changed from the UI
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+DEFAULT_DATA_DIR = "C:/Users/xhd6ct/Documents/research_data"  # only used until you press Set in the app
+
+
+def load_saved_directory():
+    """The folder you last set from the text box, if it still exists."""
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            path = json.load(f).get("dataDir")
+        if path and os.path.isdir(path):
+            return path
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+DATA_DIR = load_saved_directory() or DEFAULT_DATA_DIR
 
 SUPPORTED_EXTENSIONS = (".sldy", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
@@ -116,9 +134,44 @@ def list_files():
 
 @app.route("/api/info/<filename>")
 def file_info(filename):
-    num_planes = get_num_planes(filename)
-    return jsonify({"numPlanes": num_planes})
+    volume = load_volume(filename)
+    return jsonify({
+        "numPlanes": volume.shape[0],
+        "height": volume.shape[1],
+        "width": volume.shape[2],
+    })
 
+@app.route("/api/slice/<filename>/<axis>/<int:index>")
+def get_slice(filename, axis, index):
+    volume = load_volume(filename)
+
+    if axis == "xy":
+        arr = volume[index]
+    elif axis == "xz":
+        arr = volume[:, index, :]
+    elif axis == "yz":
+        arr = volume[:, :, index]
+    else:
+        return jsonify({"error": "invalid axis"}), 400
+
+    arr = arr.astype(np.float32)
+
+    black = request.args.get("min", type=float)
+    white = request.args.get("max", type=float)
+    if black is None:
+        black = arr.min()
+    if white is None:
+        white = arr.max()
+    if white <= black:
+        white = black + 1
+
+    arr = np.clip((arr - black) / (white - black) * 255, 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
 
 @app.route("/api/plane/<filename>/<int:plane>")
 def get_plane(filename, plane):
@@ -195,6 +248,11 @@ def set_directory():
     DATA_DIR = new_path
     histogram_cache.clear()
     volume_cache.clear()
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"dataDir": DATA_DIR}, f)
+    except OSError as e:
+        print(f"Could not save the folder setting: {e}")
     return jsonify({"path": DATA_DIR})
 
 
@@ -330,24 +388,283 @@ def peek_redo(filename, plane):
     return jsonify({"available": True, "id": row[0], "layerId": row[1], "image": row[2]})
 
 
-@app.route("/api/redo/<filename>/<int:plane>", methods=["POST"])
-def apply_redo(filename, plane):
+@app.route("/api/export/<filename>", methods=["POST"])
+def export_annotations(filename):
     data = request.get_json(silent=True) or {}
-    entry_id = data.get("id")
-    layer_id = data.get("layerId")
-    current_image = data.get("currentImage")
-    if entry_id is None or not layer_id or current_image is None:
-        return jsonify({"error": "id, layerId, currentImage required"}), 400
+    layer_ids = data.get("layerIds", [])
+    layer_names = data.get("layerNames", {})
+
+    if not layer_ids:
+        return jsonify({"error": "No layers provided"}), 400
+
+    volume = load_volume(filename)
+    num_planes = volume.shape[0]
+    height = volume.shape[1]
+    width = volume.shape[2]
 
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM action_history WHERE id = ?", (entry_id,))
-    conn.execute(
-        "INSERT INTO action_history (filename, plane, layer_id, image_data, stack, created_at) VALUES (?, ?, ?, ?, 'undo', ?)",
-        (filename, plane, layer_id, current_image, datetime.datetime.now().isoformat()),
+    rows = conn.execute(
+        "SELECT plane, image_data FROM annotations WHERE filename = ?",
+        (filename,),
+    ).fetchall()
+    conn.close()
+
+    # plane_data[plane] = { layerId: dataUrl, ... }
+    plane_data = {}
+    for plane_num, image_data in rows:
+        try:
+            plane_data[plane_num] = json.loads(image_data)
+        except (json.JSONDecodeError, TypeError):
+            plane_data[plane_num] = {}
+
+    stacks = {layer_id: [] for layer_id in layer_ids}
+
+    for p in range(num_planes):
+        layers_for_plane = plane_data.get(p, {})
+        for layer_id in layer_ids:
+            data_url = layers_for_plane.get(layer_id)
+            if data_url:
+                header, encoded = data_url.split(",", 1)
+                raw = base64.b64decode(encoded)
+                img = Image.open(io.BytesIO(raw)).convert("RGBA")
+                arr = np.array(img)
+                mask = (arr[:, :, 3] > 0).astype(np.uint8) * 255
+            else:
+                mask = np.zeros((height, width), dtype=np.uint8)
+            stacks[layer_id].append(Image.fromarray(mask, mode="L"))
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for layer_id in layer_ids:
+            pages = stacks[layer_id]
+            tiff_buf = io.BytesIO()
+            pages[0].save(
+                tiff_buf,
+                format="TIFF",
+                save_all=True,
+                append_images=pages[1:],
+            )
+            tiff_buf.seek(0)
+
+            safe_name = layer_names.get(layer_id, layer_id).replace(" ", "_")
+            zf.writestr(f"{safe_name}.tiff", tiff_buf.read())
+
+    zip_buf.seek(0)
+
+    base_name = os.path.splitext(filename)[0]
+    download_name = f"{base_name}_annotations.zip"
+
+    return send_file(
+        zip_buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=download_name,
     )
+
+def parse_hex_color(color):
+    try:
+        c = color.lstrip("#")
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (255, 59, 48)
+
+
+def store_mask_as_layer(filename, mask, layer_id, color):
+    """Save a (planes, height, width) mask into the annotations table as one layer.
+    Returns (painted_plane_count, error_message). Other layers are left untouched."""
+    volume = load_volume(filename)
+    mask = np.squeeze(mask)
+    if mask.ndim == 2:
+        mask = mask[np.newaxis, ...]
+
+    if mask.shape != volume.shape:
+        return 0, (
+            f"Mask shape {mask.shape} doesn't match the image {volume.shape} "
+            f"(planes, height, width)"
+        )
+
+    r, g, b = parse_hex_color(color)
+    conn = sqlite3.connect(DB_PATH)
+    painted_planes = 0
+    for p in range(mask.shape[0]):
+        painted = mask[p] > 0
+        if not painted.any():
+            continue
+
+        rgba = np.zeros((*painted.shape, 4), dtype=np.uint8)
+        rgba[painted] = [r, g, b, 255]
+        buf = io.BytesIO()
+        Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        row = conn.execute(
+            "SELECT image_data FROM annotations WHERE filename = ? AND plane = ?",
+            (filename, p),
+        ).fetchone()
+        try:
+            layers = json.loads(row[0]) if row else {}
+        except (json.JSONDecodeError, TypeError):
+            layers = {}
+        layers[layer_id] = data_url
+
+        conn.execute(
+            """
+            INSERT INTO annotations (filename, plane, image_data, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(filename, plane) DO UPDATE SET
+                image_data = excluded.image_data,
+                updated_at = excluded.updated_at
+            """,
+            (filename, p, json.dumps(layers), datetime.datetime.now().isoformat()),
+        )
+        painted_planes += 1
+
     conn.commit()
     conn.close()
-    return jsonify({"status": "ok"})
+    return painted_planes, None
+
+
+@app.route("/api/mask/import/<filename>", methods=["POST"])
+def import_mask(filename):
+    """Load a mask TIFF (one page per plane, nonzero = painted) into a layer."""
+    upload = request.files.get("file")
+    layer_id = request.form.get("layerId", "").strip()
+    color = request.form.get("color", "#ff3b30")
+
+    if upload is None or not layer_id:
+        return jsonify({"error": "A mask file and a layerId are required"}), 400
+
+    try:
+        mask = tiff.imread(io.BytesIO(upload.read()))
+    except Exception:
+        return jsonify({"error": "Could not read that file as a TIFF"}), 400
+
+    count, error = store_mask_as_layer(filename, mask, layer_id, color)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify({"status": "imported", "paintedPlanes": count})
+
+
+def open_sldy(filename):
+    reader = SBReadFile()
+    reader.Open(os.path.join(DATA_DIR, filename))
+    return reader
+
+
+
+
+@app.route("/api/mask/sldy/<filename>", methods=["GET"])
+def list_sldy_masks(filename):
+    """Names of the masks stored inside an .sldy file."""
+    if get_file_type(filename) != "sldy":
+        return jsonify({"masks": []})
+    try:
+        names = list(open_sldy(filename).GetMaskNames(0) or [])
+    except Exception as e:
+        return jsonify({"error": f"Could not read masks: {e}"}), 500
+    return jsonify({"masks": names})
+
+
+@app.route("/api/mask/import-sldy/<filename>", methods=["POST"])
+def import_sldy_mask(filename):
+    """Copy one mask stored inside an .sldy file into a new layer."""
+    if get_file_type(filename) != "sldy":
+        return jsonify({"error": "This is not an .sldy file"}), 400
+
+    data = request.get_json(silent=True) or {}
+    layer_id = (data.get("layerId") or "").strip()
+    mask_index = data.get("maskIndex", 0)
+    color = data.get("color", "#ff3b30")
+    if not layer_id:
+        return jsonify({"error": "layerId is required"}), 400
+
+    try:
+        reader = open_sldy(filename)
+        names = list(reader.GetMaskNames(0) or [])
+        if not names:
+            return jsonify({"error": "This file has no masks"}), 400
+        if not isinstance(mask_index, int) or not 0 <= mask_index < len(names):
+            return jsonify({"error": "Invalid mask index"}), 400
+        mask = np.array(reader.ReadMaskBuf(0, mask_index, 0, True))
+    except Exception as e:
+        return jsonify({"error": f"Could not read the mask: {e}"}), 500
+
+    count, error = store_mask_as_layer(filename, mask, layer_id, color)
+    if error:
+        return jsonify({"error": error}), 400
+    return jsonify({"status": "imported", "paintedPlanes": count, "name": names[mask_index]})
+
+
+@app.route("/api/ml/preview")
+def ml_preview():
+    import data_preview
+    import ml_job
+    n_planes = request.args.get("planes", 3, type=int)
+    patch = request.args.get("patch", 7, type=int)
+    mode = request.args.get("mode", "painted")
+    filename = request.args.get("filename") or None
+    try:
+        return jsonify(data_preview.build_preview(
+            DB_PATH, load_volume, n_planes, patch=patch,
+            guess_fn=ml_job.guess_fn(), test_keys=ml_job.test_keys(),
+            painted_keys=ml_job.painted_keys(), mode=mode, filename=filename))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ml/train", methods=["POST"])
+def ml_train():
+    import ml_job
+    body = request.get_json(silent=True) or {}
+    try:
+                ml_job.start(DB_PATH, load_volume,
+                     int(body.get("patch", 7)), int(body.get("hidden", 32)),
+                     int(body.get("steps", 500)), float(body.get("lr", 0.05)),
+                     body.get("filename"),
+                     body.get("model", "mlp"), int(body.get("base", 16)),
+                     body.get("loss"), float(body.get("beta", 0.7)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(ml_job.status())
+
+
+@app.route("/api/ml/train/status")
+def ml_train_status():
+    import ml_job
+    return jsonify(ml_job.status())
+
+
+@app.route("/api/ml/train/stop", methods=["POST"])
+def ml_train_stop():
+    import ml_job
+    ml_job.stop()
+    return jsonify({"ok": True})
+
+@app.route("/api/ml/model/save", methods=["POST"])
+def ml_model_save():
+    import ml_job
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify({"saved": ml_job.save_model(body.get("name", ""))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/ml/models")
+def ml_models():
+    import model_store
+    return jsonify(model_store.list_models())
+
+
+@app.route("/api/ml/model/load", methods=["POST"])
+def ml_model_load():
+    import ml_job
+    body = request.get_json(silent=True) or {}
+    try:
+        ml_job.load_model(body.get("name", ""))
+        return jsonify(ml_job.status())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
